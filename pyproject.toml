@@ -1,0 +1,24 @@
+[project]
+name = "recon-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.18.4",
+    "asyncpg>=0.31.0",
+    "authlib>=1.6.9",
+    "fastapi>=0.135.2",
+    "google-api-python-client>=2.193.0",
+    "itsdangerous>=2.2.0",
+    "jinja2>=3.1.6",
+    "logfire[asyncpg,botocore,fastapi,redis,requests,sqlite3,urllib]>=4.31.0",
+    "passlib>=1.7.4",
+    "pydantic-ai>=1.73.0",
+    "pydantic-settings>=2.13.1",
+    "pydantic[email]>=2.12.5",
+    "pyjwt>=2.12.1",
+    "python-jose>=3.5.0",
+    "redis>=7.4.0",
+    "sqlmodel>=0.0.37",
+]

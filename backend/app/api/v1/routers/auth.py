@@ -1,7 +1,5 @@
 """Auth router — thin HTTP layer, delegates all logic to auth_controller."""
 
-import secrets
-
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import RedirectResponse
@@ -27,7 +25,6 @@ async def google_login(request: Request):
 @router.get("/google/callback")
 async def google_callback(
     request: Request,
-    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """Handle the OAuth callback from Google."""

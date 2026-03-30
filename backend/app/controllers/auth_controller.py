@@ -1,46 +1,15 @@
-"""Auth controller — all business logic for authentication flows."""
+"""Auth controller — delegates auth orchestration to services."""
 
-import secrets
-from datetime import datetime, timezone
-
-from fastapi import HTTPException, Response
-from sqlalchemy import update
-from sqlmodel import select
+from fastapi import Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.core.config import settings
-from app.core.security import create_access_token, create_refresh_token, hash_token
-from app.models.oauth_account import OAuthAccount
-from app.models.refresh_token import RefreshToken
 from app.models.user import User
-
-
-def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
-    """Set httpOnly auth cookies on the response."""
-    response.set_cookie(
-        key="access_token",
-        value=access_token,
-        httponly=True,
-        secure=False,  # Set True in production (HTTPS)
-        samesite="lax",
-        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        path="/",
-    )
-    response.set_cookie(
-        key="refresh_token",
-        value=refresh_token,
-        httponly=True,
-        secure=False,
-        samesite="lax",
-        max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-        path="/",
-    )
-
-
-def _clear_auth_cookies(response: Response) -> None:
-    """Remove auth cookies from the response."""
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+from app.services.auth_service import (
+    find_or_create_oauth_user,
+    issue_user_tokens,
+    logout_user_session,
+    refresh_user_session,
+)
 
 
 async def handle_oauth_callback(
@@ -49,76 +18,16 @@ async def handle_oauth_callback(
     email: str,
     db: AsyncSession,
 ) -> User:
-    """
-    Find or create a user from an OAuth callback.
-
-    Account linking logic:
-    1. If this exact OAuth account exists → return the linked user
-    2. If a user with this email exists → link this provider and return
-    3. Otherwise → create a new user + OAuth account
-    """
-    # 1. Check for existing OAuth link
-    result = await db.exec(
-        select(OAuthAccount).where(
-            OAuthAccount.provider == provider,
-            OAuthAccount.provider_user_id == provider_user_id,
-        )
-    )
-    existing_oauth = result.scalar_one_or_none()
-    if existing_oauth:
-        user = await db.get(User, existing_oauth.user_id)
-        if user:
-            return user
-
-    # 2. Check for existing user with same email
-    result = await db.exec(select(User).where(User.email == email))
-    user = result.scalar_one_or_none()
-
-    if user:
-        # Link this OAuth provider to the existing account
-        oauth_account = OAuthAccount(
-            user_id=user.id,
-            provider=provider,
-            provider_user_id=provider_user_id,
-            provider_email=email,
-        )
-        db.add(oauth_account)
-        await db.flush()
-        return user
-
-    # 3. Brand new user
-    username = email.split("@")[0]
-    # Ensure username uniqueness
-    base_username = username
-    counter = 1
-    while True:
-        result = await db.exec(select(User).where(User.username == username))
-        if not result.scalar_one_or_none():
-            break
-        username = f"{base_username}{counter}"
-        counter += 1
-
-    user = User(email=email, username=username)
-    db.add(user)
-    await db.flush()
-    await db.refresh(user)
-
-    oauth_account = OAuthAccount(
-        user_id=user.id,
+    return await find_or_create_oauth_user(
+        db,
         provider=provider,
         provider_user_id=provider_user_id,
-        provider_email=email,
+        email=email,
     )
-    db.add(oauth_account)
-    await db.flush()
-    return user
 
 
 async def issue_tokens(user: User, response: Response, db: AsyncSession) -> None:
-    """Create access + refresh tokens and set them as cookies."""
-    access_token = create_access_token(user.id)
-    refresh_token = await create_refresh_token(user.id, db)
-    _set_auth_cookies(response, access_token, refresh_token)
+    await issue_user_tokens(user, response, db)
 
 
 async def handle_refresh(
@@ -126,59 +35,11 @@ async def handle_refresh(
     response: Response,
     db: AsyncSession,
 ) -> User:
-    """
-    Validate a refresh token, rotate it, and issue a new access token.
-
-    Theft detection: if a revoked token is reused, it means someone stole it
-    (the real user already rotated it). In this case, revoke ALL tokens for
-    that user as a safety measure — forces re-login on all devices.
-    """
-    if not refresh_token_value:
-        raise HTTPException(status_code=401, detail="No refresh token")
-
-    # Hash the incoming raw token to look it up in the DB
-    incoming_hash = hash_token(refresh_token_value)
-
-    result = await db.exec(
-        select(RefreshToken).where(RefreshToken.token_hash == incoming_hash)
+    return await refresh_user_session(
+        db,
+        refresh_token_value=refresh_token_value,
+        response=response,
     )
-    token_record = result.scalar_one_or_none()
-
-    if not token_record:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-    # ── Theft detection ──────────────────────────────────────
-    # If the token was already revoked (i.e., already rotated by the real user),
-    # someone else is trying to reuse it → possible theft.
-    # Revoke ALL tokens for this user to force re-login everywhere.
-    if token_record.is_revoked:
-        await db.exec(
-            update(RefreshToken)
-            .where(
-                RefreshToken.user_id == token_record.user_id,
-                RefreshToken.is_revoked == False,
-            )
-            .values(is_revoked=True)
-        )
-        raise HTTPException(
-            status_code=401,
-            detail="Refresh token reuse detected — all sessions revoked",
-        )
-
-    if token_record.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Refresh token expired")
-
-    # Rotate: revoke old token
-    token_record.is_revoked = True
-
-    # Get user
-    user = await db.get(User, token_record.user_id)
-    if not user or not user.is_active:
-        raise HTTPException(status_code=401, detail="User not found or inactive")
-
-    # Issue new tokens
-    await issue_tokens(user, response, db)
-    return user
 
 
 async def handle_logout(
@@ -186,14 +47,8 @@ async def handle_logout(
     response: Response,
     db: AsyncSession,
 ) -> None:
-    """Revoke the refresh token and clear cookies."""
-    if refresh_token_value:
-        incoming_hash = hash_token(refresh_token_value)
-        result = await db.exec(
-            select(RefreshToken).where(RefreshToken.token_hash == incoming_hash)
-        )
-        token_record = result.scalar_one_or_none()
-        if token_record:
-            token_record.is_revoked = True
-
-    _clear_auth_cookies(response)
+    await logout_user_session(
+        db,
+        refresh_token_value=refresh_token_value,
+        response=response,
+    )

@@ -7,17 +7,20 @@ import jwt
 from fastapi import Depends, HTTPException, Request, status
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
 from app.db.database import get_db
 from app.models.refresh_token import RefreshToken
+from app.models.role import Role
 from app.models.user import User
 
 
-def create_access_token(user_id: uuid.UUID) -> str:
+def create_access_token(user_id: uuid.UUID, role_name: str) -> str:
     """Create a short-lived JWT access token."""
     payload = {
         "sub": str(user_id),
+        "role": role_name,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
         "iat": datetime.now(timezone.utc),
         "type": "access",
@@ -76,8 +79,16 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    user = await db.get(User, uuid.UUID(user_id))
+    result = await db.exec(
+        select(User)
+        .options(joinedload(User.role))
+        .where(User.id == uuid.UUID(user_id))
+    )
+    user = result.one_or_none()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    if not user.role:
+        raise HTTPException(status_code=401, detail="User role not found")
 
     return user

@@ -15,7 +15,7 @@ class ModeEnum(str, Enum):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         case_sensitive=True,
-        env_file="../.env",   # Resolves to project root when run inside backend/
+        env_file=(".env", "../.env"),   # Resolves regardless of if uvicorn is run from root or backend/
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    BOOTSTRAP_ADMIN_EMAILS: list[str] = ["nrikhil@gmail.com","recon2k26@gmail.com"]
 
     # ── Database ──────────────────────────────────────────────
     DATABASE_USER: str = "postgres"
@@ -59,6 +60,17 @@ class Settings(BaseSettings):
                 query=query,
             )
         return v
+
+    @field_validator("BOOTSTRAP_ADMIN_EMAILS", mode="before")
+    @classmethod
+    def parse_bootstrap_admin_emails(cls, v: Any) -> list[str]:
+        if v in (None, ""):
+            return []
+        if isinstance(v, str):
+            return [email.strip() for email in v.split(",") if email.strip()]
+        if isinstance(v, list):
+            return [str(email).strip() for email in v if str(email).strip()]
+        raise ValueError("BOOTSTRAP_ADMIN_EMAILS must be a comma-separated string or list")
 
     # ── Google OAuth ──────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""

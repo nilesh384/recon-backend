@@ -56,14 +56,17 @@ Router (thin HTTP layer)  ->  Controller (orchestration + parsing)  ->  Service 
 - **Services** (`service.py`): Pure business logic for a single concern. No HTTP context. Receives typed data, returns domain objects or raises `HTTPException`.
 - **CRUD** (`crud.py`): Raw database operations only. SELECT, INSERT, UPDATE, DELETE. No business decisions.
 
-### Current State (Migration In Progress)
+### Three-Tier Structure
 
-The codebase has two structures coexisting:
+The codebase uses three clearly separated tiers:
 
-1. **Old horizontal layers** (`app/models/`, `app/schemas/`, `app/crud/`, `app/services/`, `app/controllers/`): Auth, users, R2 uploads live here. This is the reference implementation.
-2. **New domain slices** (`app/domains/`): Scaffolded but empty. All new features go here.
+| Tier | Path | What belongs here |
+|---|---|---|
+| **domains/** | `app/domains/` | Event business concepts. Anything that maps to what participants, zones, or ops staff experience. Owns DB tables. |
+| **infrastructure/** | `app/infrastructure/` | Technical capabilities with real logic but no business domain affinity. R2 storage, Redis pub/sub helpers, future WebSocket/chatroom. May have HTTP endpoints. No owned DB tables. |
+| **utils/** | `app/utils/` | Pure framework plumbing. FastAPI `Depends()`, shared exception classes, SQLModel base. Flat files only. No HTTP endpoints. |
 
-New domains use `router.py -> controller.py -> service.py -> crud.py` inside their domain folder.
+**The decision rule:** if it maps to an event concept → `domains/`. If it's a technical capability the app provides → `infrastructure/`. If it's framework glue → `utils/`.
 
 ### Directory Structure
 
@@ -78,22 +81,27 @@ backend/app/
     database.py
   models/
     __init__.py                 # Alembic aggregator — import all domain models here
-  shared/                       # Cross-domain utilities
-    deps/                       # FastAPI Depends() — get_db, get_redis, get_current_user, require_roles
-    rbac/                       # Startup role seeding and admin bootstrap
-    exceptions/                 # Shared HTTP exception classes
-    storage/                    # R2/S3 client and presigned URL logic
-      validators/               # File type/extension/key validation
+  utils/                        # Framework plumbing only — flat files, no sub-packages
+    deps.py                     # get_db, get_redis, get_current_user, require_roles
+    exceptions.py               # Shared HTTP exception classes
+    rbac.py                     # Startup role seeding and admin bootstrap
     models/
       base.py                   # Base SQLModel (id, created_at, updated_at)
-  domains/                      # All business features as vertical slices
+  infrastructure/               # Technical capabilities with logic and endpoints
+    storage/                    # Cloudflare R2 — presigned upload/read URLs
+      service/                  # r2_service.py — boto3 client, URL generation
+      controller/               # r2_controller.py — validation, file key logic
+      router/                   # r2_router.py — GET /r2/upload-url, /r2/read-url
+      schemas/                  # r2_schemas.py — PresignedUploadResponse, PresignedReadResponse
+      tests/
+  domains/                      # All event business features as vertical slices
     auth/                       # COMPLETE — OAuth, JWT, user CRUD
       models/                   # user.py, role.py, oauth_account.py, refresh_token.py
       schemas/                  # UserRead, UserCreate, UserUpdate, UserProfile, RoleRead
       crud/                     # All DB operations for auth models
-      service/                  # Business logic (OAuth flow, token management, user management)
-      controller/               # Orchestration layer
-      router/                   # /auth/* and /users/* routes
+      service/                  # auth_service.py, user_service.py, helpers.py
+      controller/               # auth_controller.py, user_controller.py
+      router/                   # auth_router.py (/auth/*), user_router.py (/users/*)
       tests/
     participants/               # SCAFFOLD ONLY
     zones/                      # SCAFFOLD ONLY
@@ -107,32 +115,36 @@ backend/app/
     admin/                      # SCAFFOLD ONLY (no models/, no crud/)
   api/
     v1/
-      api.py                    # Mounts domain routers — one include_router per domain
-      routers/
-        r2.py                   # Infrastructure router — R2 presigned URLs
+      api.py                    # Mounts all routers — one include_router per domain + infrastructure
 ```
 
 ### Adding a New Domain
 
-1. Create folder under `domains/<name>/` with: `__init__.py`, `router.py`, `controller.py`, `service.py`, `crud.py`, `models.py`, `schemas.py`
+1. Create folder under `domains/<name>/` with: `__init__.py`, `models/`, `schemas/`, `crud/`, `service/`, `controller/`, `router/`, `tests/`
 2. Add model imports to `app/models/__init__.py` so Alembic discovers them
 3. Add one `include_router()` line in `api/v1/api.py`
 4. Write tests in `domains/<name>/tests/`
 5. Update the **Project State** section in this file to reflect what was added
 
-A contributor owns their entire domain folder end-to-end. Cross-domain touches are limited to steps 2, 3, and 5.
+### Adding a New Infrastructure Capability
+
+1. Create folder under `infrastructure/<name>/` with: `service/`, `controller/`, `router/` (and `schemas/`, `tests/` as needed)
+2. Add one `include_router()` line in `api/v1/api.py` if it has HTTP endpoints
+3. Update the **Project State** section in this file
+
+A contributor owns their entire domain or infrastructure folder end-to-end. Cross-domain touches are limited to steps 2, 3, and the Project State update.
 
 ---
 
 ## Base Model
 
-All database models inherit from `app.models.base.Base` which provides:
+All database models inherit from `app.utils.models.base.Base` which provides:
 - `id`: UUID primary key (auto-generated)
 - `created_at`: timezone-aware datetime with server default
 - `updated_at`: timezone-aware datetime with onupdate trigger
 
 ```python
-from app.models.base import Base
+from app.utils.models.base import Base
 
 class Zone(Base, ZoneBase, table=True):
     __tablename__ = "zones"
@@ -146,7 +158,7 @@ class Zone(Base, ZoneBase, table=True):
 Never import raw Redis or Session clients in business logic. Always use `Depends()`:
 
 ```python
-from app.api.deps import get_db, get_redis, get_current_user, require_roles
+from app.utils.deps import get_db, get_redis, get_current_user, require_roles
 
 @router.get("/zones")
 async def list_zones(db: AsyncSession = Depends(get_db)):
@@ -159,7 +171,7 @@ async def override_zone(user: User = Depends(require_roles("admin", "ops_chief")
 
 ### Roles
 
-Defined in `app/models/role.py`. Current roles: `admin`, `participant`, `partner`. Default role assigned to all new users is `participant`. Use `require_roles()` from `api/deps.py` for route-level access control. Every route must declare its required role explicitly. The `applicant` role has been removed — registration and selection are handled externally by Luma.
+Defined in `app/domains/auth/models/role.py`. Current roles: `admin`, `participant`, `partner`. Default role assigned to all new users is `participant`. Use `require_roles()` from `app/utils/deps.py` for route-level access control. Every route must declare its required role explicitly. The `applicant` role has been removed — registration and selection are handled externally by Luma.
 
 ---
 
@@ -233,23 +245,23 @@ Rules:
 
 Agents MUST update this section after completing any meaningful change — domain additions, structural migrations, schema changes, or architectural decisions. This is the living state of the codebase. Do not leave it stale.
 
-### Current Migration Status
+### Current Architecture Status
 
-- Vertical domain slice migration is complete for the auth domain. All old horizontal directories (`models/`, `schemas/`, `crud/`, `services/`, `controllers/`) have been deleted.
-- `shared/` is populated: `deps/`, `rbac/`, `exceptions/`, `storage/`, `storage/validators/`, `models/base.py`.
-- `domains/auth/` is fully migrated with `models/`, `schemas/`, `crud/`, `service/`, `controller/`, `router/`, `tests/` — all as packages.
-- All other domain folders are scaffolded (empty `__init__.py` files only).
-- `app/models/__init__.py` is the Alembic aggregator — import new domain models here when added.
-- `api/v1/api.py` mounts domain routers — add one `include_router` per domain here.
-- `api/v1/routers/r2.py` is the only infrastructure router (R2 uploads). Logic lives in `shared/storage/`.
+Three-tier structure is complete and stable:
+
+- **`utils/`** — flat files only: `deps.py`, `exceptions.py`, `rbac.py`, `models/base.py`
+- **`infrastructure/storage/`** — fully implemented: R2 presigned upload/read URLs via boto3. Mounts at `/api/v1/r2/`.
+- **`domains/auth/`** — fully implemented: Google OAuth, JWT tokens, refresh/logout, user CRUD, RBAC seeding
+- All other domain folders are scaffolded (empty `__init__.py` files only)
+- `app/models/__init__.py` is the Alembic aggregator — import new domain models here when added
+- `api/v1/api.py` mounts all routers (domains + infrastructure) — add one `include_router` per new domain or infrastructure capability here
 
 ### Domains Status
 
 | Domain | Status | Notes |
 |---|---|---|
-| auth | Complete (old structure) | Google OAuth, JWT tokens, refresh/logout |
-| users | Complete (old structure) | CRUD, role assignment, RBAC seeding. Roles: admin/participant/partner. No applicant role. |
-| r2 | Complete (old structure) | Presigned upload/read URLs via Cloudflare R2 |
+| auth | Complete | Google OAuth, JWT tokens, refresh/logout |
+| users | Complete | CRUD, role assignment, RBAC seeding. Roles: admin/participant/partner. No applicant role. |
 | participants | Not started | Profile, QR check-in, NFC token assignment |
 | zones | Not started | Capacity, queue, status (red/amber/green) |
 | points | Not started | Passport economy, earn/spend, leaderboard |
@@ -258,12 +270,20 @@ Agents MUST update this section after completing any meaningful change — domai
 | webhooks | Not started | n8n form payload ingestion |
 | admin | Not started | Aggregated ops dashboard, overrides |
 
+### Infrastructure Status
+
+| Capability | Status | Notes |
+|---|---|---|
+| storage (R2) | Complete | Presigned upload/read URLs. `infrastructure/storage/`. Mounts at `/api/v1/r2/`. |
+| cache (Redis) | Not started | Redis pub/sub helpers, key management utilities |
+| realtime | Not started | WebSocket chatroom — planned feature |
+
 ---
 
 ## What NOT to Do
 
 - Do not leave the **Project State** section outdated after making changes. Update it before finishing any task.
-- Do not add a flat `controllers/` file outside of a domain folder. Controllers belong inside `domains/<name>/controller.py`.
+- Do not add a flat `controllers/` file outside of a domain or infrastructure folder. Controllers belong inside `domains/<name>/controller/` or `infrastructure/<name>/controller/`.
 - Do not import raw `engine` or `Redis()` in service/business logic. Use `Depends()`.
 - Do not put business logic in routers. Routers validate input and call services.
 - Do not create models without adding their import to `app/models/__init__.py`.
